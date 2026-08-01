@@ -103,18 +103,19 @@ flowchart TB
         PAY["/pay<br/>scan QRIS · pay"]
         CASHOUT["/cashout<br/>request cash · pickup QR"]
         AGENTPG["/agent<br/>scan pickup · release cash"]
+        RESETPG["/reset-pin<br/>redeem WhatsApp reset link · set new PIN"]
         CAM["📷 Camera / ZXing<br/>QRIS + pickup scanning"]
-        WKIT["🦊 Stellar Wallets Kit<br/>Freighter · Albedo — crypto tab"]
+        WKIT["🦊 Stellar Wallets Kit<br/>Freighter · Albedo — crypto tab · connection persisted"]
         SESS["Session token<br/>(localStorage)"]
     end
 
     subgraph backend["⚙️ Backend — Bun + Hono API"]
         direction TB
-        AUTH["auth<br/>HMAC session tokens · WhatsApp OTP · argon2 PIN"]
+        AUTH["auth<br/>HMAC session tokens · WhatsApp OTP<br/>mandatory argon2 PIN · WhatsApp PIN-reset · freeze"]
         LIMITS["limits<br/>FATF Tier-0 caps · 30-day window"]
         CUSTODY["custody<br/>per-user Stellar keypair"]
         DEPOSIT["deposit<br/>card → cIDR at reference rate · Circle USDC · native XLM"]
-        FX["fx<br/>reference-rate quote · optional USDC→cIDR path payment"]
+        FX["fx<br/>reference-rate quote · live XLM→rupiah quote · optional USDC→cIDR path payment"]
         SOROBANL["soroban client<br/>escrow lock / release / refund"]
         QRIS["qris<br/>decode QRIS TLV payload"]
         SETTLE["settlement<br/>IDR payout"]
@@ -165,6 +166,7 @@ flowchart TB
     DEPOSIT --> RATES
     FX --> HORIZON
     FX --> DEX
+    FX --> COINBASE
     STELLARL --> HORIZON
     SOROBANL --> SRPC --> ESCROW
     HORIZON --- ISSUER
@@ -178,9 +180,9 @@ flowchart TB
 
 | Layer | Tech | Responsibility |
 |---|---|---|
-| **Frontend** | Next.js 16, React 19, Tailwind 4, ZXing | Camera scanning + card entry (the two things a chat can't do); rupiah-first UI; holds only a signed session token |
-| **Backend** | Bun, Hono, Drizzle | Auth, custody, FX orchestration, limits, settlement, QRIS decode |
-| **Database** | Postgres | `users` (wallet + hashed PIN/OTP), `transactions` (ledger + idempotency markers), `cashouts`, `rates` |
+| **Frontend** | Next.js 16, React 19, Tailwind 4, ZXing | Camera scanning + card entry (the two things a chat can't do); rupiah-first UI with deposit result cards; the mandatory set-PIN and `/reset-pin` screens; persisted wallet connection; holds only a signed session token |
+| **Backend** | Bun, Hono, Drizzle | Auth (mandatory PIN, WhatsApp PIN-reset, account freeze), custody, FX orchestration, limits, settlement, QRIS decode |
+| **Database** | Postgres | `users` (wallet + hashed PIN/OTP + `frozen` flag), `transactions` (ledger + idempotency markers), `cashouts`, `rates` |
 | **Smart contract** | Rust, soroban-sdk 26 | `escrow` — hashlocked cash-out custody (`lock` / `release` / `refund` / `get_escrow`) |
 | **Card** | Stripe Checkout | Card acquiring for top-ups and Quick Pay; the charge is credited straight to the user as `cIDR` at the reference rate (fiat at the processor is the reserve) |
 | **Crypto on-ramp** | Stellar Wallets Kit (Freighter · Albedo) | Connect a wallet and deposit real Circle testnet USDC or native XLM, taken as reserve to issue `cIDR` (anchor-style, no DEX) |
@@ -205,7 +207,8 @@ flowchart TB
   `pathPaymentStrictSend` with a `destMin` slippage bound derived from that quote. A
   market-maker (distributor) account keeps a two-sided book priced around the live USD/IDR mid
   (30 bps spread), repriced off-chain by `refresh-market.ts`. `/fx/quote` is a reference-rate
-  preview.
+  preview, and `/fx/xlm-quote` powers a live rupiah preview for native-XLM deposits (XLM→USD via
+  Coinbase→cIDR at the reference rate).
 - **Escrow = Soroban, only where trust is needed.** Cash-out locks `cIDR` under a hashlock
   (`pickup_hash = sha256(code)`); the agent releases it by presenting the code. Checks-effects-
   interactions ordering, a refund timelock protecting the agent, TTL extension, and property/fuzz
@@ -225,11 +228,14 @@ sequenceDiagram
     participant SX as Stellar
 
     U->>FE: enter WhatsApp number
+    Note over FE,BE: Send code waits until the free-tier backend is warm
     FE->>BE: /auth/request
     BE->>TW: send OTP on WhatsApp
-    U->>FE: enter OTP → set 6-digit PIN
+    U->>FE: enter OTP (or magic link)
     BE-->>FE: signed session token
     Note over BE: custody creates a Stellar keypair for the user
+    U->>FE: "One last step" — set 6-digit PIN (mandatory)
+    Note over FE,BE: weak PINs rejected · no wallet access until a PIN is set
     U->>FE: + Add money ($) — Fiat tab
     FE->>BE: /deposit/create
     BE->>ST: create Checkout session
@@ -268,6 +274,26 @@ sequenceDiagram
     Note over BE: treasury holds the crypto as reserve (anchor-style, no DEX)
     BE->>SX: distributor issues cIDR at the reference rate
     BE-->>FE: rupiah balance updated
+```
+
+**A3 · Forgot PIN → single-use WhatsApp reset link**
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant FE as Web app
+    participant BE as Backend
+    participant TW as Twilio
+
+    U->>FE: Forgot PIN
+    FE->>BE: POST /me/pin/reset-link
+    BE->>TW: single-use, 15-min link over WhatsApp → /reset-pin?t=<token>
+    Note over BE: link is never returned by the API — receiving it on WhatsApp is the proof
+    U->>FE: open /reset-pin, set new PIN
+    FE->>BE: POST /auth/pin/reset
+    Note over BE: clear old PIN hash · set new PIN · issue fresh session
+    BE-->>FE: new session token
+    Note over BE,TW: "your PIN was changed" alert on WhatsApp — reply BLOCK to freeze the account
 ```
 
 **B · Pay a merchant** — two ways, same on-chain settlement
@@ -323,8 +349,17 @@ sequenceDiagram
 ### 2.5 Security posture (summary)
 
 - Identity is always derived from a **server-signed HMAC token**, never a client-supplied field.
-- **PIN** (argon2) authorises every spend and never travels over WhatsApp; OTP + PIN both hashed,
-  both attempt-limited, all secret comparisons timing-safe.
+- **A 6-digit PIN is mandatory onboarding** — after the first sign-in (OTP or magic link) a new user
+  must set one on a required "One last step" screen before the wallet unlocks; weak PINs (sequential
+  runs like `123456`, repeats like `111111`) are rejected. The **PIN** (argon2) authorises every spend
+  and never travels over WhatsApp; OTP + PIN both hashed, both attempt-limited, all secret comparisons
+  timing-safe. A PIN locks after 5 failures and routes to the forgot-PIN reset.
+- **Forgot PIN → single-use WhatsApp reset link.** `/me/pin/reset-link` sends a single-use, 15-minute
+  link over WhatsApp (never returned by the API — receiving it is the proof) to the `/reset-pin` web
+  page; redeeming it (`/auth/pin/reset`) clears the old PIN hash, sets the new one, and issues a fresh
+  session.
+- **Account freeze.** The owner freezes the account (`users.frozen`) by replying **BLOCK** to the
+  "your PIN was changed" WhatsApp alert; all spends are blocked while frozen.
 - Card flows (`/deposit/confirm`, `/pay/quick/confirm`) are **idempotent** (per-leg DB markers) and
   verified server-side against Stripe.
 - **Known limitations (honest):** user Stellar secret keys are stored unencrypted for the testnet
