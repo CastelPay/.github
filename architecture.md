@@ -1,9 +1,12 @@
 # Castel — Architecture
 
 **Cash on Stellar.** A holiday wallet that lets USD/EUR tourists pay any Indonesian QRIS
-merchant and withdraw rupiah cash — no local bank account, SIM, or ID. Card top-up becomes
-USDC on Stellar, swaps to rupiah (`cIDR`) on Stellar's built-in DEX, and pays the merchant
-in real rupiah through a licensed settlement partner.
+merchant and withdraw rupiah cash — no local bank account, SIM, or ID. A card top-up is
+credited straight to the user as rupiah (`cIDR`) at the live USD/IDR reference rate — the
+fiat held at the processor is the reserve. Crypto-native users can instead connect a Stellar
+wallet and deposit real Circle USDC or native XLM, taken as reserve at the same reference
+rate. Either way the merchant is paid in real rupiah through a licensed settlement partner,
+and Stellar's built-in DEX powers the optional `USDC → cIDR` exchange.
 
 This document has two views of the same system:
 
@@ -17,33 +20,39 @@ This document has two views of the same system:
 
 ## 1. Simple view
 
-The whole product is three moves: **fund → swap → pay** (with an optional **cash out**).
+The whole product is three moves: **fund → pay → (optionally) cash out**. The balance is
+rupiah (`cIDR`) the moment it's funded — no swap sits between funding and paying.
 
 ```mermaid
 flowchart LR
     T["🧳 Tourist<br/>USD / EUR card"]
+    W["🦊 Crypto user<br/>Freighter wallet"]
     APP["📱 Castel<br/>web app + backend"]
     STRIPE["💳 Stripe<br/>card top-up"]
-    STELLAR["⭐ Stellar<br/>USDC → cIDR on the DEX"]
+    STELLAR["⭐ Stellar<br/>cIDR balance<br/>(rupiah on-chain)"]
     XENDIT["🏦 Licensed partner<br/>pays QRIS in rupiah"]
     MERCHANT["🍜 QRIS merchant<br/>receives rupiah"]
     AGENT["💵 Money-changer agent<br/>hands over cash"]
 
     T --> APP
-    APP -->|1. top up| STRIPE
-    STRIPE --> APP
-    APP -->|2. swap to rupiah| STELLAR
-    APP -->|3. pay merchant| XENDIT --> MERCHANT
+    APP -->|1a. top up by card| STRIPE
+    STRIPE -->|credit cIDR at reference rate| STELLAR
+    W -.->|1b. deposit Circle USDC / native XLM| STELLAR
+    APP -->|2. pay merchant| XENDIT --> MERCHANT
+    STELLAR --- APP
     STELLAR -.->|optional: cash out via escrow| AGENT
     AGENT -.-> T
 ```
 
-**In words:** the tourist logs in with their WhatsApp number, tops up by card, and their
-balance appears in **rupiah**. When they scan a merchant's QRIS code, Castel swaps their
-balance to rupiah on Stellar's DEX and pays the merchant through a licensed partner — the
-merchant just receives a normal QRIS payment and never touches crypto. Any leftover balance
-can be collected as physical cash from a partner money-changer, secured on-chain by a
-Soroban escrow.
+**In words:** the tourist logs in with their WhatsApp number and tops up by card — the card
+is charged in USD and Castel credits the balance directly in **rupiah** at the live reference
+rate, so the balance is rupiah from the start. Crypto-native users can instead connect a
+Stellar wallet and deposit real Circle USDC or native XLM, which the treasury takes as reserve
+to issue the same rupiah balance. When they scan a merchant's QRIS code, Castel transfers that
+rupiah balance on-chain and pays the merchant through a licensed partner — no swap is needed,
+because the balance is already rupiah, and the merchant just receives a normal QRIS payment
+and never touches crypto. Any leftover balance can be collected as physical cash from a
+partner money-changer, secured on-chain by a Soroban escrow.
 
 ---
 
@@ -61,6 +70,7 @@ flowchart TB
         CASHOUT["/cashout<br/>request cash · pickup QR"]
         AGENTPG["/agent<br/>scan pickup · release cash"]
         CAM["📷 Camera / ZXing<br/>QRIS + pickup scanning"]
+        WKIT["🦊 Stellar Wallets Kit<br/>Freighter · Albedo — crypto tab"]
         SESS["Session token<br/>(localStorage)"]
     end
 
@@ -69,7 +79,8 @@ flowchart TB
         AUTH["auth<br/>HMAC session tokens · WhatsApp OTP · argon2 PIN"]
         LIMITS["limits<br/>FATF Tier-0 caps · 30-day window"]
         CUSTODY["custody<br/>per-user Stellar keypair"]
-        FX["fx<br/>DEX quote + strict-send path payment"]
+        DEPOSIT["deposit<br/>card → cIDR at reference rate · Circle USDC · native XLM"]
+        FX["fx<br/>reference-rate quote · optional USDC→cIDR path payment"]
         SOROBANL["soroban client<br/>escrow lock / release / refund"]
         QRIS["qris<br/>decode QRIS TLV payload"]
         SETTLE["settlement<br/>IDR payout"]
@@ -86,15 +97,16 @@ flowchart TB
         TWILIO["💬 Twilio<br/>WhatsApp OTP + bot"]
         XENDIT["🏦 Xendit<br/>IDR disbursement / QRIS"]
         ERAPI["📈 exchangerate-api.com<br/>USD/IDR mid"]
+        COINBASE["📈 Coinbase<br/>XLM/USD spot"]
     end
 
     subgraph chain["⭐ Stellar — Testnet"]
         direction TB
         HORIZON["Horizon API"]
         SRPC["Soroban RPC"]
-        DEX["Built-in DEX<br/>USDC ↔ cIDR order book"]
+        DEX["Built-in DEX<br/>USDC ↔ cIDR order book<br/>(optional exchange path only)"]
         ISSUER["cIDR issuer<br/>AUTH_REVOCABLE + CLAWBACK"]
-        TREASURY["Treasury + Distributor<br/>float · market maker"]
+        TREASURY["Treasury + Distributor<br/>reserve · issues cIDR at reference rate · market maker"]
         USERACC["Per-user accounts<br/>cIDR / USDC trustlines"]
         ESCROW["Escrow contract (Soroban)<br/>CDG65OKW…VXW6UG"]
     end
@@ -102,6 +114,7 @@ flowchart TB
     client -->|HTTPS JSON · Bearer token| backend
     CAM -.-> PAY
     CAM -.-> AGENTPG
+    WKIT -.->|sign & broadcast Circle USDC / native XLM deposit| chain
 
     AUTH --> TWILIO
     AUTH --> PG
@@ -111,8 +124,11 @@ flowchart TB
     RATES --> ERAPI
     RATES --> PG
     backend -->|deposit / quick-pay checkout| STRIPE
+    DEPOSIT -->|XLM/USD spot| COINBASE
     TWILIO -->|inbound webhook| backend
 
+    DEPOSIT --> STELLARL
+    DEPOSIT --> RATES
     FX --> HORIZON
     FX --> DEX
     STELLARL --> HORIZON
@@ -132,21 +148,30 @@ flowchart TB
 | **Backend** | Bun, Hono, Drizzle | Auth, custody, FX orchestration, limits, settlement, QRIS decode |
 | **Database** | Postgres | `users` (wallet + hashed PIN/OTP), `transactions` (ledger + idempotency markers), `cashouts`, `rates` |
 | **Smart contract** | Rust, soroban-sdk 26 | `escrow` — hashlocked cash-out custody (`lock` / `release` / `refund` / `get_escrow`) |
-| **Card** | Stripe Checkout | Card acquiring for top-ups and Quick Pay |
+| **Card** | Stripe Checkout | Card acquiring for top-ups and Quick Pay; the charge is credited straight to the user as `cIDR` at the reference rate (fiat at the processor is the reserve) |
+| **Crypto on-ramp** | Stellar Wallets Kit (Freighter · Albedo) | Connect a wallet and deposit real Circle testnet USDC or native XLM, taken as reserve to issue `cIDR` (anchor-style, no DEX) |
 | **Messaging** | Twilio WhatsApp | OTP delivery + inbound bot |
 | **Settlement** | Xendit | Rupiah payout to the merchant (sandbox in demo) |
-| **FX reference** | exchangerate-api.com | Live USD/IDR mid the DEX book is repriced around |
-| **Chain** | Stellar testnet (Horizon + Soroban RPC) | Asset issuance, DEX path payments, escrow |
+| **FX reference** | exchangerate-api.com · Coinbase | Live USD/IDR mid the card/crypto rails credit at and the DEX book is repriced around; Coinbase XLM/USD spot prices XLM deposits |
+| **Chain** | Stellar testnet (Horizon + Soroban RPC) | Asset issuance, optional DEX path payments, escrow |
 
 ### 2.3 On-chain design
 
 - **`cIDR`** — a rupiah unit of account issued on Stellar. The issuer account carries
   `AUTH_REVOCABLE` + `AUTH_CLAWBACK_ENABLED` so balances can be frozen/reversed for fraud or
   lawful order. SEP-1 `stellar.toml` is served at the live domain. Testnet only, no fiat backing.
-- **FX = native DEX, not a contract.** `swapUsdcToCidr` quotes the live order book
-  (`strictSendPaths`) and executes a `pathPaymentStrictSend` with a `destMin` slippage bound
-  derived from that quote. A market-maker (distributor) account keeps a two-sided book priced
-  around the live USD/IDR mid (30 bps spread), repriced off-chain by `refresh-market.ts`.
+- **Funding rails issue cIDR directly at the reference rate.** The card, Quick Pay, native XLM
+  and Circle-USDC rails are all DEX-free: the processor or the treasury takes the incoming
+  value as reserve and the distributor issues `cIDR` at the live USD/IDR reference rate (card
+  charges carry a 30 bps spread; `creditUsdAsRupiah`). XLM deposits are verified by tx hash
+  (idempotent) and priced XLM→USD (Coinbase spot)→IDR; Circle USDC is a real testnet asset
+  (issuer `GBBD47IF…FLA5`) sent from the user's own wallet.
+- **The native DEX powers only the optional USDC→rupiah exchange.** `swapUsdcToCidr`
+  (`quoteUsdcToCidr`) quotes the live order book (`strictSendPaths`) and executes a
+  `pathPaymentStrictSend` with a `destMin` slippage bound derived from that quote. A
+  market-maker (distributor) account keeps a two-sided book priced around the live USD/IDR mid
+  (30 bps spread), repriced off-chain by `refresh-market.ts`. `/fx/quote` is a reference-rate
+  preview.
 - **Escrow = Soroban, only where trust is needed.** Cash-out locks `cIDR` under a hashlock
   (`pickup_hash = sha256(code)`); the agent releases it by presenting the code. Checks-effects-
   interactions ordering, a refund timelock protecting the agent, TTL extension, and property/fuzz
@@ -163,7 +188,7 @@ sequenceDiagram
     participant BE as Backend
     participant TW as Twilio
     participant ST as Stripe
-    participant SX as Stellar (DEX)
+    participant SX as Stellar
 
     U->>FE: enter WhatsApp number
     FE->>BE: /auth/request
@@ -171,14 +196,43 @@ sequenceDiagram
     U->>FE: enter OTP → set 6-digit PIN
     BE-->>FE: signed session token
     Note over BE: custody creates a Stellar keypair for the user
-    U->>FE: + Add money ($)
+    U->>FE: + Add money ($) — Fiat tab
     FE->>BE: /deposit/create
     BE->>ST: create Checkout session
-    U->>ST: pay by card
+    U->>ST: pay by card (USD)
     ST-->>FE: redirect back
-    FE->>BE: /deposit/confirm
+    FE->>BE: /deposit/confirm (or /deposit/charge for saved card)
     BE->>ST: verify session is paid + owned by user
-    BE->>SX: treasury → user USDC, then path-payment swap USDC → cIDR
+    Note over BE: fiat at the processor is the reserve
+    BE->>SX: distributor issues cIDR to user at USD/IDR reference rate (−30 bps)
+    BE-->>FE: rupiah balance updated
+```
+
+**A2 · Connect a wallet — crypto on-ramp (Circle USDC / native XLM)**
+
+```mermaid
+sequenceDiagram
+    participant U as Tourist
+    participant FE as Web app
+    participant WK as Stellar Wallets Kit
+    participant BE as Backend
+    participant SX as Stellar
+
+    U->>FE: + Add money → Crypto tab → pick XLM or USDC
+    U->>WK: connect Freighter (Albedo fallback)
+    alt Circle testnet USDC
+        FE->>BE: /deposit/circle/prepare
+        U->>WK: sign USDC send → user's Castel address
+        WK->>SX: broadcast USDC payment
+        FE->>BE: /deposit/circle/convert
+    else Native XLM
+        U->>WK: sign XLM payment → treasury
+        WK->>SX: broadcast XLM payment
+        FE->>BE: /deposit/xlm/convert (tx hash)
+        Note over BE: verify by tx hash (idempotent) · price XLM→USD (Coinbase)→IDR
+    end
+    Note over BE: treasury holds the crypto as reserve (anchor-style, no DEX)
+    BE->>SX: distributor issues cIDR at the reference rate
     BE-->>FE: rupiah balance updated
 ```
 
@@ -198,11 +252,13 @@ sequenceDiagram
     alt Pay from balance (prefunded)
         U->>FE: confirm + PIN
         FE->>BE: /pay
+        Note over BE: balance is already rupiah — no swap
         BE->>SX: user → treasury (cIDR, on-chain)
     else Quick Pay (no balance, card per-payment)
         FE->>BE: /pay/quick/create → Stripe Checkout
         U->>FE: pay by card → /pay/quick/confirm
-        BE->>SX: credit + swap + user → treasury (cIDR)
+        Note over BE: issue cIDR directly at the reference rate (no swap)
+        BE->>SX: issue cIDR to user, then user → treasury (cIDR)
     end
     BE->>XN: disburse rupiah to merchant
     XN->>M: QRIS payment settled in IDR
